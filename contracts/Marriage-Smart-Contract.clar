@@ -10,6 +10,12 @@
 (define-constant err-insufficient-funds (err u108))
 (define-constant err-invalid-amount (err u109))
 (define-constant err-marriage-fee-required (err u110))
+(define-constant err-registry-not-found (err u111))
+(define-constant err-registry-exists (err u112))
+(define-constant err-registry-inactive (err u113))
+(define-constant err-item-not-found (err u114))
+(define-constant err-item-fulfilled (err u115))
+(define-constant err-invalid-contributor (err u116))
 
 (define-data-var marriage-fee uint u1000000)
 (define-data-var total-marriages uint u0)
@@ -81,9 +87,49 @@
     }
 )
 
+(define-map gift-registries
+    { registry-id: uint }
+    {
+        partner-1: principal,
+        partner-2: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        target-amount: uint,
+        collected-amount: uint,
+        created-block: uint,
+        status: (string-ascii 20),
+    }
+)
+
+(define-map gift-items
+    { item-id: uint }
+    {
+        registry-id: uint,
+        item-name: (string-ascii 100),
+        item-description: (string-ascii 300),
+        item-price: uint,
+        fulfilled: bool,
+        fulfilled-by: (optional principal),
+    }
+)
+
+(define-map gift-contributions
+    {
+        registry-id: uint,
+        contributor: principal,
+    }
+    {
+        amount: uint,
+        contribution-block: uint,
+        message: (string-ascii 200),
+    }
+)
+
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-marriage-id uint u1)
 (define-data-var next-certificate-id uint u1)
+(define-data-var next-registry-id uint u1)
+(define-data-var next-gift-item-id uint u1)
 
 (define-read-only (get-marriage-fee)
     (var-get marriage-fee)
@@ -637,4 +683,232 @@
         marriage (>= stacks-block-height (get anniversary-block marriage))
         false
     )
+)
+
+(define-public (create-gift-registry
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (target-amount uint)
+    )
+    (let (
+            (partner (unwrap! (get-partner tx-sender) err-not-married))
+            (marriage (unwrap! (get-marriage tx-sender partner) err-not-married))
+            (registry-id (var-get next-registry-id))
+        )
+        (asserts! (is-eq (get status marriage) "active") err-not-married)
+        (asserts! (> target-amount u0) err-invalid-amount)
+
+        (map-set gift-registries { registry-id: registry-id } {
+            partner-1: tx-sender,
+            partner-2: partner,
+            title: title,
+            description: description,
+            target-amount: target-amount,
+            collected-amount: u0,
+            created-block: stacks-block-height,
+            status: "active",
+        })
+
+        (var-set next-registry-id (+ registry-id u1))
+        (ok registry-id)
+    )
+)
+
+(define-public (close-gift-registry (registry-id uint))
+    (let ((registry (unwrap! (get-gift-registry registry-id) err-registry-not-found)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get partner-1 registry))
+                (is-eq tx-sender (get partner-2 registry))
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status registry) "active") err-registry-inactive)
+
+        (map-set gift-registries { registry-id: registry-id }
+            (merge registry { status: "closed" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (add-gift-item
+        (registry-id uint)
+        (item-name (string-ascii 100))
+        (item-description (string-ascii 300))
+        (item-price uint)
+    )
+    (let (
+            (registry (unwrap! (get-gift-registry registry-id) err-registry-not-found))
+            (item-id (var-get next-gift-item-id))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get partner-1 registry))
+                (is-eq tx-sender (get partner-2 registry))
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status registry) "active") err-registry-inactive)
+        (asserts! (> item-price u0) err-invalid-amount)
+
+        (map-set gift-items { item-id: item-id } {
+            registry-id: registry-id,
+            item-name: item-name,
+            item-description: item-description,
+            item-price: item-price,
+            fulfilled: false,
+            fulfilled-by: none,
+        })
+
+        (var-set next-gift-item-id (+ item-id u1))
+        (ok item-id)
+    )
+)
+
+(define-public (fulfill-gift-item (item-id uint))
+    (let ((item (unwrap! (get-gift-item item-id) err-item-not-found)))
+        (asserts! (not (get fulfilled item)) err-item-fulfilled)
+
+        (try! (stx-transfer? (get item-price item) tx-sender (as-contract tx-sender)))
+
+        (map-set gift-items { item-id: item-id }
+            (merge item {
+                fulfilled: true,
+                fulfilled-by: (some tx-sender),
+            })
+        )
+
+        (let ((registry (unwrap! (get-gift-registry (get registry-id item))
+                err-registry-not-found
+            )))
+            (map-set gift-registries { registry-id: (get registry-id item) }
+                (merge registry { collected-amount: (+ (get collected-amount registry) (get item-price item)) })
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (contribute-to-registry
+        (registry-id uint)
+        (amount uint)
+        (message (string-ascii 200))
+    )
+    (let ((registry (unwrap! (get-gift-registry registry-id) err-registry-not-found)))
+        (asserts! (is-eq (get status registry) "active") err-registry-inactive)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts!
+            (and
+                (not (is-eq tx-sender (get partner-1 registry)))
+                (not (is-eq tx-sender (get partner-2 registry)))
+            )
+            err-invalid-contributor
+        )
+
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+        (let ((existing-contribution (get-gift-contribution registry-id tx-sender)))
+            (match existing-contribution
+                contribution (map-set gift-contributions {
+                    registry-id: registry-id,
+                    contributor: tx-sender,
+                }
+                    (merge contribution {
+                        amount: (+ (get amount contribution) amount),
+                        message: message,
+                    })
+                )
+                (map-set gift-contributions {
+                    registry-id: registry-id,
+                    contributor: tx-sender,
+                } {
+                    amount: amount,
+                    contribution-block: stacks-block-height,
+                    message: message,
+                })
+            )
+        )
+
+        (map-set gift-registries { registry-id: registry-id }
+            (merge registry { collected-amount: (+ (get collected-amount registry) amount) })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (withdraw-registry-funds (registry-id uint))
+    (let ((registry (unwrap! (get-gift-registry registry-id) err-registry-not-found)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get partner-1 registry))
+                (is-eq tx-sender (get partner-2 registry))
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status registry) "closed") err-registry-inactive)
+
+        (let (
+                (withdrawal-amount (/ (get collected-amount registry) u2))
+                (partner-1 (get partner-1 registry))
+                (partner-2 (get partner-2 registry))
+            )
+            (try! (as-contract (stx-transfer? withdrawal-amount tx-sender partner-1)))
+            (try! (as-contract (stx-transfer? withdrawal-amount tx-sender partner-2)))
+
+            (map-set gift-registries { registry-id: registry-id }
+                (merge registry { collected-amount: u0 })
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-gift-registry (registry-id uint))
+    (map-get? gift-registries { registry-id: registry-id })
+)
+
+(define-read-only (get-gift-item (item-id uint))
+    (map-get? gift-items { item-id: item-id })
+)
+
+(define-read-only (get-gift-contribution
+        (registry-id uint)
+        (contributor principal)
+    )
+    (map-get? gift-contributions {
+        registry-id: registry-id,
+        contributor: contributor,
+    })
+)
+
+(define-read-only (get-registry-progress (registry-id uint))
+    (match (get-gift-registry registry-id)
+        registry
+        {
+            target-amount: (get target-amount registry),
+            collected-amount: (get collected-amount registry),
+            completion-percentage: (/ (* (get collected-amount registry) u100)
+                (get target-amount registry)
+            ),
+            status: (get status registry),
+        }
+        {
+            target-amount: u0,
+            collected-amount: u0,
+            completion-percentage: u0,
+            status: "not-found",
+        }
+    )
+)
+
+(define-read-only (get-next-registry-id)
+    (var-get next-registry-id)
+)
+
+(define-read-only (get-next-gift-item-id)
+    (var-get next-gift-item-id)
 )
