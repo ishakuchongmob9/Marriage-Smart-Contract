@@ -16,6 +16,11 @@
 (define-constant err-item-not-found (err u114))
 (define-constant err-item-fulfilled (err u115))
 (define-constant err-invalid-contributor (err u116))
+(define-constant err-mentorship-not-found (err u117))
+(define-constant err-mentorship-exists (err u118))
+(define-constant err-invalid-mentor (err u119))
+(define-constant err-mentorship-completed (err u120))
+(define-constant err-session-not-found (err u121))
 
 (define-data-var marriage-fee uint u1000000)
 (define-data-var total-marriages uint u0)
@@ -125,11 +130,58 @@
     }
 )
 
+(define-map mentorship-programs
+    { mentorship-id: uint }
+    {
+        mentor-partner-1: principal,
+        mentor-partner-2: principal,
+        mentee-partner-1: principal,
+        mentee-partner-2: principal,
+        program-start-block: uint,
+        program-end-block: uint,
+        sessions-completed: uint,
+        total-sessions: uint,
+        mentor-fee: uint,
+        status: (string-ascii 20),
+        program-focus: (string-ascii 200),
+    }
+)
+
+(define-map mentorship-sessions
+    {
+        mentorship-id: uint,
+        session-number: uint,
+    }
+    {
+        session-date: uint,
+        session-notes: (string-ascii 500),
+        mentor-rating: uint,
+        mentee-rating: uint,
+        session-completed: bool,
+    }
+)
+
+(define-map mentor-profiles
+    { mentor-couple-id: uint }
+    {
+        partner-1: principal,
+        partner-2: principal,
+        marriage-years: uint,
+        specializations: (string-ascii 300),
+        total-mentorships: uint,
+        average-rating: uint,
+        mentor-fee-rate: uint,
+        available: bool,
+    }
+)
+
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-marriage-id uint u1)
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-registry-id uint u1)
 (define-data-var next-gift-item-id uint u1)
+(define-data-var next-mentorship-id uint u1)
+(define-data-var next-mentor-couple-id uint u1)
 
 (define-read-only (get-marriage-fee)
     (var-get marriage-fee)
@@ -911,4 +963,208 @@
 
 (define-read-only (get-next-gift-item-id)
     (var-get next-gift-item-id)
+)
+
+(define-read-only (get-mentorship-program (mentorship-id uint))
+    (map-get? mentorship-programs { mentorship-id: mentorship-id })
+)
+
+(define-read-only (get-mentorship-session
+        (mentorship-id uint)
+        (session-number uint)
+    )
+    (map-get? mentorship-sessions {
+        mentorship-id: mentorship-id,
+        session-number: session-number,
+    })
+)
+
+(define-read-only (get-mentor-profile (mentor-couple-id uint))
+    (map-get? mentor-profiles { mentor-couple-id: mentor-couple-id })
+)
+
+(define-read-only (calculate-mentorship-reward (sessions-completed uint))
+    (* sessions-completed u250000)
+)
+
+(define-public (register-as-mentor
+        (specializations (string-ascii 300))
+        (fee-rate uint)
+    )
+    (let (
+            (partner (unwrap! (get-partner tx-sender) err-not-married))
+            (marriage (unwrap! (get-marriage tx-sender partner) err-not-married))
+            (mentor-couple-id (var-get next-mentor-couple-id))
+            (marriage-duration (get-marriage-duration tx-sender partner))
+        )
+        (asserts! (is-eq (get status marriage) "active") err-not-married)
+        (asserts! (>= marriage-duration u26280) err-invalid-amount)
+        (asserts! (> fee-rate u0) err-invalid-amount)
+
+        (map-set mentor-profiles { mentor-couple-id: mentor-couple-id } {
+            partner-1: tx-sender,
+            partner-2: partner,
+            marriage-years: (/ marriage-duration u52560),
+            specializations: specializations,
+            total-mentorships: u0,
+            average-rating: u0,
+            mentor-fee-rate: fee-rate,
+            available: true,
+        })
+
+        (var-set next-mentor-couple-id (+ mentor-couple-id u1))
+        (ok mentor-couple-id)
+    )
+)
+
+(define-public (start-mentorship-program
+        (mentor-couple-id uint)
+        (program-focus (string-ascii 200))
+        (total-sessions uint)
+        (program-duration uint)
+    )
+    (let (
+            (mentor-profile (unwrap! (get-mentor-profile mentor-couple-id) err-invalid-mentor))
+            (mentee-partner (unwrap! (get-partner tx-sender) err-not-married))
+            (mentee-marriage (unwrap! (get-marriage tx-sender mentee-partner) err-not-married))
+            (mentorship-id (var-get next-mentorship-id))
+            (total-fee (* (get mentor-fee-rate mentor-profile) total-sessions))
+        )
+        (asserts! (is-eq (get status mentee-marriage) "active") err-not-married)
+        (asserts! (get available mentor-profile) err-invalid-mentor)
+        (asserts! (> total-sessions u0) err-invalid-amount)
+        (asserts! (> program-duration u0) err-invalid-amount)
+        (asserts!
+            (not (or
+                (is-eq tx-sender (get partner-1 mentor-profile))
+                (is-eq tx-sender (get partner-2 mentor-profile))
+            ))
+            err-invalid-mentor
+        )
+
+        (try! (stx-transfer? total-fee tx-sender (as-contract tx-sender)))
+
+        (map-set mentorship-programs { mentorship-id: mentorship-id } {
+            mentor-partner-1: (get partner-1 mentor-profile),
+            mentor-partner-2: (get partner-2 mentor-profile),
+            mentee-partner-1: tx-sender,
+            mentee-partner-2: mentee-partner,
+            program-start-block: stacks-block-height,
+            program-end-block: (+ stacks-block-height program-duration),
+            sessions-completed: u0,
+            total-sessions: total-sessions,
+            mentor-fee: total-fee,
+            status: "active",
+            program-focus: program-focus,
+        })
+
+        (map-set mentor-profiles { mentor-couple-id: mentor-couple-id }
+            (merge mentor-profile { available: false })
+        )
+
+        (var-set next-mentorship-id (+ mentorship-id u1))
+        (ok mentorship-id)
+    )
+)
+
+(define-public (complete-mentorship-session
+        (mentorship-id uint)
+        (session-notes (string-ascii 500))
+        (mentor-rating uint)
+        (mentee-rating uint)
+    )
+    (let (
+            (program (unwrap! (get-mentorship-program mentorship-id)
+                err-mentorship-not-found
+            ))
+            (current-session (+ (get sessions-completed program) u1))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get mentor-partner-1 program))
+                (is-eq tx-sender (get mentor-partner-2 program))
+                (is-eq tx-sender (get mentee-partner-1 program))
+                (is-eq tx-sender (get mentee-partner-2 program))
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status program) "active") err-mentorship-completed)
+        (asserts! (<= current-session (get total-sessions program))
+            err-invalid-amount
+        )
+        (asserts! (and (>= mentor-rating u1) (<= mentor-rating u5))
+            err-invalid-amount
+        )
+        (asserts! (and (>= mentee-rating u1) (<= mentee-rating u5))
+            err-invalid-amount
+        )
+
+        (map-set mentorship-sessions {
+            mentorship-id: mentorship-id,
+            session-number: current-session,
+        } {
+            session-date: stacks-block-height,
+            session-notes: session-notes,
+            mentor-rating: mentor-rating,
+            mentee-rating: mentee-rating,
+            session-completed: true,
+        })
+
+        (map-set mentorship-programs { mentorship-id: mentorship-id }
+            (merge program { sessions-completed: current-session })
+        )
+
+        (if (is-eq current-session (get total-sessions program))
+            (unwrap! (finalize-mentorship-program mentorship-id) err-not-found)
+            true
+        )
+
+        (ok true)
+    )
+)
+
+(define-private (finalize-mentorship-program (mentorship-id uint))
+    (let (
+            (program (unwrap! (get-mentorship-program mentorship-id)
+                err-mentorship-not-found
+            ))
+            (mentor-fee (get mentor-fee program))
+            (mentor-reward (/ (* mentor-fee u80) u100))
+            (platform-fee (/ (* mentor-fee u20) u100))
+        )
+        (map-set mentorship-programs { mentorship-id: mentorship-id }
+            (merge program { status: "completed" })
+        )
+
+        (try! (as-contract (stx-transfer? (/ mentor-reward u2) tx-sender
+            (get mentor-partner-1 program)
+        )))
+        (try! (as-contract (stx-transfer? (/ mentor-reward u2) tx-sender
+            (get mentor-partner-2 program)
+        )))
+
+        (var-set contract-balance (+ (var-get contract-balance) platform-fee))
+
+        (ok true)
+    )
+)
+
+(define-public (update-mentor-availability
+        (mentor-couple-id uint)
+        (available bool)
+    )
+    (let ((mentor-profile (unwrap! (get-mentor-profile mentor-couple-id) err-invalid-mentor)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get partner-1 mentor-profile))
+                (is-eq tx-sender (get partner-2 mentor-profile))
+            )
+            err-unauthorized
+        )
+
+        (map-set mentor-profiles { mentor-couple-id: mentor-couple-id }
+            (merge mentor-profile { available: available })
+        )
+        (ok true)
+    )
 )
