@@ -21,6 +21,9 @@
 (define-constant err-invalid-mentor (err u119))
 (define-constant err-mentorship-completed (err u120))
 (define-constant err-session-not-found (err u121))
+(define-constant err-memory-not-found (err u122))
+(define-constant err-invalid-memory-type (err u123))
+(define-constant err-memory-limit-reached (err u124))
 
 (define-data-var marriage-fee uint u1000000)
 (define-data-var total-marriages uint u0)
@@ -175,6 +178,46 @@
     }
 )
 
+(define-map marriage-memories
+    { memory-id: uint }
+    {
+        partner-1: principal,
+        partner-2: principal,
+        memory-type: (string-ascii 20),
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        location: (string-ascii 100),
+        memory-date: uint,
+        created-block: uint,
+        visibility: (string-ascii 10),
+        likes: uint,
+    }
+)
+
+(define-map memory-reactions
+    {
+        memory-id: uint,
+        reactor: principal,
+    }
+    {
+        reaction-type: (string-ascii 10),
+        reaction-block: uint,
+    }
+)
+
+(define-map couple-memory-counts
+    {
+        partner-1: principal,
+        partner-2: principal,
+    }
+    {
+        total-memories: uint,
+        anniversary-memories: uint,
+        milestone-memories: uint,
+        special-memories: uint,
+    }
+)
+
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-marriage-id uint u1)
 (define-data-var next-certificate-id uint u1)
@@ -182,6 +225,7 @@
 (define-data-var next-gift-item-id uint u1)
 (define-data-var next-mentorship-id uint u1)
 (define-data-var next-mentor-couple-id uint u1)
+(define-data-var next-memory-id uint u1)
 
 (define-read-only (get-marriage-fee)
     (var-get marriage-fee)
@@ -1166,5 +1210,204 @@
             (merge mentor-profile { available: available })
         )
         (ok true)
+    )
+)
+
+(define-public (create-marriage-memory
+        (memory-type (string-ascii 20))
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (location (string-ascii 100))
+        (memory-date uint)
+        (visibility (string-ascii 10))
+    )
+    (let (
+            (partner (unwrap! (get-partner tx-sender) err-not-married))
+            (marriage (unwrap! (get-marriage tx-sender partner) err-not-married))
+            (memory-id (var-get next-memory-id))
+            (current-count (default-to {
+                total-memories: u0,
+                anniversary-memories: u0,
+                milestone-memories: u0,
+                special-memories: u0,
+            }
+                (get-couple-memory-count tx-sender partner)
+            ))
+        )
+        (asserts! (is-eq (get status marriage) "active") err-not-married)
+        (asserts! (<= (get total-memories current-count) u100)
+            err-memory-limit-reached
+        )
+        (asserts!
+            (or
+                (is-eq memory-type "anniversary")
+                (is-eq memory-type "milestone")
+                (is-eq memory-type "special")
+                (is-eq memory-type "vacation")
+                (is-eq memory-type "achievement")
+            )
+            err-invalid-memory-type
+        )
+        (asserts! (or (is-eq visibility "public") (is-eq visibility "private"))
+            err-invalid-amount
+        )
+
+        (map-set marriage-memories { memory-id: memory-id } {
+            partner-1: tx-sender,
+            partner-2: partner,
+            memory-type: memory-type,
+            title: title,
+            description: description,
+            location: location,
+            memory-date: memory-date,
+            created-block: stacks-block-height,
+            visibility: visibility,
+            likes: u0,
+        })
+
+        (let ((updated-count (merge current-count {
+                total-memories: (+ (get total-memories current-count) u1),
+                anniversary-memories: (if (is-eq memory-type "anniversary")
+                    (+ (get anniversary-memories current-count) u1)
+                    (get anniversary-memories current-count)
+                ),
+                milestone-memories: (if (is-eq memory-type "milestone")
+                    (+ (get milestone-memories current-count) u1)
+                    (get milestone-memories current-count)
+                ),
+                special-memories: (if (is-eq memory-type "special")
+                    (+ (get special-memories current-count) u1)
+                    (get special-memories current-count)
+                ),
+            })))
+            (map-set couple-memory-counts {
+                partner-1: tx-sender,
+                partner-2: partner,
+            }
+                updated-count
+            )
+        )
+
+        (var-set next-memory-id (+ memory-id u1))
+        (ok memory-id)
+    )
+)
+
+(define-public (react-to-memory
+        (memory-id uint)
+        (reaction-type (string-ascii 10))
+    )
+    (let ((memory (unwrap! (get-marriage-memory memory-id) err-memory-not-found)))
+        (asserts! (is-eq (get visibility memory) "public") err-unauthorized)
+        (asserts!
+            (or
+                (is-eq reaction-type "love")
+                (is-eq reaction-type "like")
+                (is-eq reaction-type "heart")
+            )
+            err-invalid-amount
+        )
+
+        (map-set memory-reactions {
+            memory-id: memory-id,
+            reactor: tx-sender,
+        } {
+            reaction-type: reaction-type,
+            reaction-block: stacks-block-height,
+        })
+
+        (map-set marriage-memories { memory-id: memory-id }
+            (merge memory { likes: (+ (get likes memory) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-memory-visibility
+        (memory-id uint)
+        (new-visibility (string-ascii 10))
+    )
+    (let ((memory (unwrap! (get-marriage-memory memory-id) err-memory-not-found)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get partner-1 memory))
+                (is-eq tx-sender (get partner-2 memory))
+            )
+            err-unauthorized
+        )
+        (asserts!
+            (or (is-eq new-visibility "public") (is-eq new-visibility "private"))
+            err-invalid-amount
+        )
+
+        (map-set marriage-memories { memory-id: memory-id }
+            (merge memory { visibility: new-visibility })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-marriage-memory (memory-id uint))
+    (map-get? marriage-memories { memory-id: memory-id })
+)
+
+(define-read-only (get-memory-reaction
+        (memory-id uint)
+        (reactor principal)
+    )
+    (map-get? memory-reactions {
+        memory-id: memory-id,
+        reactor: reactor,
+    })
+)
+
+(define-read-only (get-couple-memory-count
+        (partner-1 principal)
+        (partner-2 principal)
+    )
+    (match (map-get? couple-memory-counts {
+        partner-1: partner-1,
+        partner-2: partner-2,
+    })
+        count (some count)
+        (map-get? couple-memory-counts {
+            partner-1: partner-2,
+            partner-2: partner-1,
+        })
+    )
+)
+
+(define-read-only (get-memory-stats (memory-id uint))
+    (match (get-marriage-memory memory-id)
+        memory
+        {
+            memory-id: memory-id,
+            title: (get title memory),
+            memory-type: (get memory-type memory),
+            likes: (get likes memory),
+            visibility: (get visibility memory),
+            created-block: (get created-block memory),
+        }
+        {
+            memory-id: u0,
+            title: "",
+            memory-type: "",
+            likes: u0,
+            visibility: "",
+            created-block: u0,
+        }
+    )
+)
+
+(define-read-only (calculate-memory-milestone-reward (memory-count uint))
+    (if (<= memory-count u10)
+        u50000
+        (if (<= memory-count u25)
+            u100000
+            (if (<= memory-count u50)
+                u250000
+                u500000
+            )
+        )
     )
 )
