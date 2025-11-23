@@ -1411,3 +1411,76 @@
         )
     )
 )
+
+(define-read-only (get-user-dashboard (user principal))
+    (let (
+            (profile-opt (get-user-profile user))
+            (partner-opt (get-partner user))
+            (is-married-flag (is-married user))
+            (marriage-summary (match partner-opt
+                partner (match (get-marriage user partner)
+                    marriage
+                    {
+                        partner: partner,
+                        status: (get status marriage),
+                        shared-assets: (get shared-assets marriage),
+                        marriage-block: (get marriage-block marriage),
+                        anniversary-block: (get anniversary-block marriage),
+                    }
+                    {
+                        partner: partner,
+                        status: "none",
+                        shared-assets: u0,
+                        marriage-block: u0,
+                        anniversary-block: u0,
+                    }
+                )
+                {
+                    partner: user,
+                    status: "single",
+                    shared-assets: u0,
+                    marriage-block: u0,
+                    anniversary-block: u0,
+                }
+            ))
+            (memory-counts-opt (match partner-opt
+                partner (get-couple-memory-count user partner)
+                none
+            ))
+            (memory-counts (default-to {
+                total-memories: u0,
+                anniversary-memories: u0,
+                milestone-memories: u0,
+                special-memories: u0,
+            }
+                memory-counts-opt
+            ))
+            (profile (default-to {
+                display-name: "Unknown",
+                relationship-status: "unknown",
+                partner: none,
+                marriage-count: u0,
+                created-block: u0,
+            }
+                profile-opt
+            ))
+        )
+        {
+            user: user,
+            display-name: (get display-name profile),
+            relationship-status: (get relationship-status profile),
+            marriage-count: (get marriage-count profile),
+            created-block: (get created-block profile),
+            is-married: is-married-flag,
+            partner: (get partner marriage-summary),
+            marriage-status: (get status marriage-summary),
+            shared-assets: (get shared-assets marriage-summary),
+            marriage-block: (get marriage-block marriage-summary),
+            anniversary-block: (get anniversary-block marriage-summary),
+            total-memories: (get total-memories memory-counts),
+            anniversary-memories: (get anniversary-memories memory-counts),
+            milestone-memories: (get milestone-memories memory-counts),
+            special-memories: (get special-memories memory-counts),
+        }
+    )
+)
